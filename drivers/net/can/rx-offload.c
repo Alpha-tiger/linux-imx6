@@ -1,18 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2014 David Jander, Protonic Holland
  * Copyright (C) 2014-2017 Pengutronix, Marc Kleine-Budde <kernel@pengutronix.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the version 2 of the GNU General Public License
- * as published by the Free Software Foundation
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <linux/can/dev.h>
@@ -55,11 +44,11 @@ static int can_rx_offload_napi_poll(struct napi_struct *napi, int quota)
 
 	while ((work_done < quota) &&
 	       (skb = skb_dequeue(&offload->skb_queue))) {
-		struct canfd_frame *cf = (struct canfd_frame *)skb->data;
+		struct can_frame *cf = (struct can_frame *)skb->data;
 
 		work_done++;
 		stats->rx_packets++;
-		stats->rx_bytes += cf->len;
+		stats->rx_bytes += cf->can_dlc;
 		netif_receive_skb(skb);
 	}
 
@@ -79,7 +68,7 @@ static int can_rx_offload_napi_poll(struct napi_struct *napi, int quota)
 static inline void __skb_queue_add_sort(struct sk_buff_head *head, struct sk_buff *new,
 					int (*compare)(struct sk_buff *a, struct sk_buff *b))
 {
-	struct sk_buff *pos, *insert = (struct sk_buff *)head;
+	struct sk_buff *pos, *insert = NULL;
 
 	skb_queue_reverse_walk(head, pos) {
 		const struct can_rx_offload_cb *cb_pos, *cb_new;
@@ -99,8 +88,10 @@ static inline void __skb_queue_add_sort(struct sk_buff_head *head, struct sk_buf
 		insert = pos;
 		break;
 	}
-
-	__skb_queue_after(head, insert, new);
+	if (!insert)
+		__skb_queue_head(head, new);
+	else
+		__skb_queue_after(head, insert, new);
 }
 
 static int can_rx_offload_compare(struct sk_buff *a, struct sk_buff *b)
@@ -119,19 +110,32 @@ static int can_rx_offload_compare(struct sk_buff *a, struct sk_buff *b)
 static struct sk_buff *can_rx_offload_offload_one(struct can_rx_offload *offload, unsigned int n)
 {
 	struct sk_buff *skb = NULL;
-	u32 timestamp;
+	struct can_rx_offload_cb *cb;
+	struct can_frame *cf;
+	int ret;
 
 	/* If queue is full or skb not available, read to discard mailbox */
-	bool drop = unlikely(skb_queue_len(&offload->skb_queue) >
-					   offload->skb_queue_len_max);
+	if (likely(skb_queue_len(&offload->skb_queue) <=
+		   offload->skb_queue_len_max))
+		skb = alloc_can_skb(offload->dev, &cf);
 
-	if (offload->mailbox_read(offload, drop, &skb, &timestamp, n) && !skb)
-		offload->dev->stats.rx_dropped++;
+	if (!skb) {
+		struct can_frame cf_overflow;
+		u32 timestamp;
 
-	if (skb) {
-		struct can_rx_offload_cb *cb = can_rx_offload_get_cb(skb);
+		ret = offload->mailbox_read(offload, &cf_overflow,
+					    &timestamp, n);
+		if (ret)
+			offload->dev->stats.rx_dropped++;
 
-		cb->timestamp = timestamp;
+		return NULL;
+	}
+
+	cb = can_rx_offload_get_cb(skb);
+	ret = offload->mailbox_read(offload, cf, &cb->timestamp, n);
+	if (!ret) {
+		kfree_skb(skb);
+		return NULL;
 	}
 
 	return skb;
@@ -290,7 +294,7 @@ int can_rx_offload_add_timestamp(struct net_device *dev, struct can_rx_offload *
 		weight = offload->mb_first - offload->mb_last;
 	}
 
-	return can_rx_offload_init_queue(dev, offload, weight);;
+	return can_rx_offload_init_queue(dev, offload, weight);
 }
 EXPORT_SYMBOL_GPL(can_rx_offload_add_timestamp);
 
@@ -302,17 +306,6 @@ int can_rx_offload_add_fifo(struct net_device *dev, struct can_rx_offload *offlo
 	return can_rx_offload_init_queue(dev, offload, weight);
 }
 EXPORT_SYMBOL_GPL(can_rx_offload_add_fifo);
-
-int can_rx_offload_add_manual(struct net_device *dev,
-			      struct can_rx_offload *offload,
-			      unsigned int weight)
-{
-	if (offload->mailbox_read)
-		return -EINVAL;
-
-	return can_rx_offload_init_queue(dev, offload, weight);
-}
-EXPORT_SYMBOL_GPL(can_rx_offload_add_manual);
 
 void can_rx_offload_enable(struct can_rx_offload *offload)
 {
